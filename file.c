@@ -17,7 +17,10 @@
 #include <linux/blkdev.h>
 #include <linux/fsnotify.h>
 #include <linux/security.h>
+#include <linux/falloc.h>
 #include "fat.h"
+
+static long fat_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 
 static int fat_ioctl_get_attributes(struct inode *inode, u32 __user *user_attr)
 {
@@ -114,12 +117,6 @@ out:
 	return err;
 }
 
-static int fat_ioctl_get_volume_id(struct inode *inode, u32 __user *user_attr)
-{
-	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
-	return put_user(sbi->vol_id, user_attr);
-}
-
 long fat_generic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
@@ -130,8 +127,6 @@ long fat_generic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return fat_ioctl_get_attributes(inode, user_attr);
 	case FAT_IOCTL_SET_ATTRIBUTES:
 		return fat_ioctl_set_attributes(filp, user_attr);
-	case FAT_IOCTL_GET_VOLUME_ID:
-		return fat_ioctl_get_volume_id(inode, user_attr);
 	default:
 		return -ENOTTY;	/* Inappropriate ioctl for device */
 	}
@@ -170,10 +165,10 @@ int fat_file_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 
 const struct file_operations fat_file_operations = {
 	.llseek		= generic_file_llseek,
-	.read		= new_sync_read,
-	.write		= new_sync_write,
-	.read_iter	= generic_file_read_iter,
-	.write_iter	= generic_file_write_iter,
+	.read		= do_sync_read,
+	.write		= do_sync_write,
+	.aio_read	= generic_file_aio_read,
+	.aio_write	= generic_file_aio_write,
 	.mmap		= generic_file_mmap,
 	.release	= fat_file_release,
 	.unlocked_ioctl	= fat_generic_ioctl,
@@ -182,8 +177,97 @@ const struct file_operations fat_file_operations = {
 #endif
 	.fsync		= fat_file_fsync,
 	.splice_read	= generic_file_splice_read,
+	.fallocate	= fat_fallocate,
 };
 
+//expand non zerofill hack
+static int fat_cont_expand_nzf(struct inode *inode, loff_t size)
+{
+	struct address_space *mapping = inode->i_mapping;
+	loff_t start = inode->i_size, count = size - inode->i_size;
+	int nr_cluster; //# of cluster to allocated
+	loff_t mm_bytes; //length
+	loff_t ondisksize;
+	struct super_block *sb = inode->i_sb;
+	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+	int err;
+	
+	int tick = CURRENT_TIME_SEC.tv_sec;
+
+	printk(KERN_WARNING "[fat] cont_expand_nzf\n");
+	err = generic_cont_expand_simple(inode, size);
+	
+	/*allocate clusters */
+	
+	ondisksize = inode->i_blocks << 9;
+
+	printk(KERN_WARNING "[fat] i_blocks: %d\n", inode->i_blocks);
+	
+	if((size) <= ondisksize)
+		goto out;
+
+	mm_bytes = size - ondisksize;
+	nr_cluster = (mm_bytes + (sbi->cluster_size -1)) >> sbi->cluster_bits;
+
+	printk(KERN_WARNING "cluster_size: %d, cluster_bits: %d\n", sbi->cluster_size, sbi->cluster_bits);
+	
+	printk(KERN_WARNING "[fat] nr_cluster=%d\n", nr_cluster);
+
+	while(nr_cluster-- > 0){
+		err = fat_add_cluster(inode);
+		if(err)
+			goto out;
+	}
+	
+	//write last block
+	if(size>0){
+		//fake mmu_private here
+		unsigned long blocks = sbi->sec_per_clus * (nr_cluster);
+		if(blocks>0)
+			MSDOS_I(inode)->mmu_private = blocks << sb->s_blocksize_bits;
+		
+		printk(KERN_WARNING "[fat] write last block\n");
+		struct page*page;
+		void* fsdata;
+		
+		loff_t minsize = size < sbi->cluster_size? size:sbi->cluster_size;
+		
+		err = pagecache_write_begin(NULL, mapping, size, 0, AOP_FLAG_UNINTERRUPTIBLE, &page, &fsdata);
+		if(err)
+			goto out;
+		
+		err = pagecache_write_end(NULL, mapping, size, 0,0, page, fsdata);
+	}
+	tick = CURRENT_TIME_SEC.tv_sec - tick;
+	printk(KERN_WARNING "[fat] generic_cont_expand_simple done in %d\n", tick);
+
+	if(err)
+		goto out;
+
+	inode->i_ctime = inode->i_mtime = CURRENT_TIME_SEC;
+	
+	mark_inode_dirty(inode);
+	
+	/*************************************************************************/
+	if(IS_SYNC(inode)) {
+		int err2;
+		printk(KERN_WARNING "[fat] IS_SYNC\n");
+
+		
+		err = filemap_fdatawrite_range(mapping, start, start + count -1);
+		err2 = sync_mapping_buffers(mapping);
+		if(!err)
+			err = err2;
+		err2 = write_inode_now(inode, 1);
+		if(!err)
+			err = err2;
+		if(!err){
+			err = filemap_fdatawait_range(mapping, start, start+count-1);
+		}
+	}
+out:
+	return err;
+}
 static int fat_cont_expand(struct inode *inode, loff_t size)
 {
 	struct address_space *mapping = inode->i_mapping;
@@ -220,9 +304,64 @@ out:
 	return err;
 }
 
+/* fallocate */
+
+static long fat_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+{
+	int nr_cluster; //# of cluster to allocated
+	loff_t mm_bytes; //length
+	loff_t ondisksize;
+	struct inode *inode = file->f_mapping->host;
+	struct super_block *sb = inode->i_sb;
+	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+	int err = 0;
+
+	if(mode & ~FALLOC_FL_KEEP_SIZE)
+		return -EOPNOTSUPP;
+
+	if(!S_ISREG(inode->i_mode))
+		return -EOPNOTSUPP;
+
+	
+	mutex_lock(&inode->i_mutex);
+	if(mode & FALLOC_FL_KEEP_SIZE){
+		printk(KERN_WARNING "[fat] FALLOC_FL_KEEP_SIZE\n");
+
+		ondisksize = inode->i_blocks << 9;
+
+		if((offset + len) <= ondisksize)
+			goto error;
+
+		mm_bytes = offset + len - ondisksize;
+		nr_cluster = (mm_bytes + (sbi->cluster_size -1)) >> sbi->cluster_bits;
+
+		printk(KERN_WARNING "[fat] nr_cluster=%d\n", nr_cluster);
+
+		while(nr_cluster-- > 0){
+			err = fat_add_cluster(inode);
+			if(err)
+				goto error;
+		}
+	}else{
+		printk(KERN_WARNING "[fat] FALLOC TRUCNATE\n");
+		if((offset + len) <= i_size_read(inode))
+			goto error;
+
+		//err = fat_cont_expand(inode, (offset + len));
+		err = fat_cont_expand_nzf(inode, (offset + len));
+		
+	}
+
+error:
+	mutex_unlock(&inode->i_mutex);
+	return err;
+}
+
 /* Free all clusters after the skip'th cluster. */
 static int fat_free(struct inode *inode, int skip)
 {
+	printk(KERN_WARNING "[fat] fat_free %d\n", skip);
+
 	struct super_block *sb = inode->i_sb;
 	int err, wait, free_start, i_start, i_logstart;
 
@@ -443,9 +582,6 @@ int fat_setattr(struct dentry *dentry, struct iattr *attr)
 	}
 
 	if (attr->ia_valid & ATTR_SIZE) {
-		error = fat_block_truncate_page(inode, attr->ia_size);
-		if (error)
-			goto out;
 		down_write(&MSDOS_I(inode)->truncate_lock);
 		truncate_setsize(inode, attr->ia_size);
 		fat_truncate_blocks(inode, attr->ia_size);
